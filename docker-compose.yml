@@ -1,0 +1,13 @@
+services:
+  gemini-api:
+    build: .
+    container_name: gemini-webapi
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      GEMINI_COOKIE_PATH: /data/gemini_cookies
+    volumes:
+      - ./gemini_cookies:/data/gemini_cookies
