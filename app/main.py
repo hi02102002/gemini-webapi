@@ -7,13 +7,17 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from gemini_webapi import GeminiClient
 from gemini_webapi.exceptions import AuthError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+DEFAULT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gemini-web")
+GEMINI_WEB_MODEL = os.getenv("GEMINI_WEB_MODEL")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -23,7 +27,33 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+FORWARD_OPENAI_MODEL_TO_GEMINI = _env_bool("FORWARD_OPENAI_MODEL_TO_GEMINI", False)
+
+
+def _gemini_kwargs(*, temporary: bool, request_model: str | None = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"temporary": temporary}
+    # OPENAI_COMPAT_MODEL is the public model id for OpenAI-compatible clients.
+    # GEMINI_WEB_MODEL is the optional internal model id forwarded to gemini_webapi.
+    # By default we do NOT forward arbitrary OpenAI-compatible model ids to gemini_webapi.
+    if GEMINI_WEB_MODEL:
+        kwargs["model"] = GEMINI_WEB_MODEL
+    elif FORWARD_OPENAI_MODEL_TO_GEMINI and request_model and request_model != DEFAULT_MODEL:
+        kwargs["model"] = request_model
+    return kwargs
+
+
+def _approx_tokens(value: Any) -> int:
+    """Cheap usage approximation so OpenAI-compatible clients have a usage object."""
+    if value is None:
+        return 0
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False)
+    return max(1, len(value) // 4)
+
+
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str = Field(..., min_length=1)
     model: str | None = None
     temporary: bool = True
@@ -41,40 +71,38 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
-
 class ChatMessage(BaseModel):
-    role: Literal["developer", "system", "user", "assistant", "tool"]
-    content: Any | None = None
+    model_config = ConfigDict(extra="allow")
+
+    # OpenAI/AI SDK normally sends: system | user | assistant | tool.
+    # Keep this as str to avoid 422 for newer roles such as developer.
+    role: str
+    content: Any = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     messages: list[ChatMessage] = Field(..., min_length=1)
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = "auto"
-    temperature: float | None = None  # Accepted for compatibility; gemini_webapi does not expose this reliably.
-    max_tokens: int | None = None     # Accepted for compatibility; gemini_webapi does not expose this reliably.
-    top_p: float | None = None        # Accepted for compatibility.
+    temperature: float | None = None
+    max_tokens: int | None = None
+    top_p: float | None = None
     stop: str | list[str] | None = None
     response_format: dict[str, Any] | None = None
     stream: bool = False
     stream_options: dict[str, Any] | None = None
+
+    # Wrapper-only option. AI SDK can pass it via providerOptions/body if needed.
     temporary: bool = True
 
 
 API_KEY = os.getenv("APP_API_KEY")
-DEFAULT_CHAT_MODEL = os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-web")
-COMPAT_MODEL_IDS = [
-    model.strip()
-    for model in os.getenv(
-        "OPENAI_COMPAT_MODELS",
-        "gemini-web,gemini-3-flash-thinking-advanced",
-    ).split(",")
-    if model.strip()
-]
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 REQUEST_TIMEOUT = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "300"))
 INIT_TIMEOUT = float(os.getenv("GEMINI_INIT_TIMEOUT", "30"))
@@ -87,14 +115,17 @@ def require_api_key(
     x_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> None:
+    """
+    Accept both:
+    - X-API-Key: <key>               # useful for curl/custom clients
+    - Authorization: Bearer <key>    # what @ai-sdk/openai-compatible sends when apiKey is set
+    """
     if not API_KEY:
         return
 
     bearer_token = None
-    if authorization:
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() == "bearer" and token:
-            bearer_token = token
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer_token = authorization.split(" ", 1)[1].strip()
 
     if x_api_key != API_KEY and bearer_token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -137,7 +168,6 @@ def serialize_output(output: Any) -> dict[str, Any]:
     }
 
 
-
 def _extract_json_object(text: str | None) -> dict[str, Any] | None:
     """Best-effort parser for model JSON output."""
     if not text:
@@ -163,36 +193,24 @@ def _extract_json_object(text: str | None) -> dict[str, Any] | None:
     return None
 
 
-def _content_to_prompt_text(content: Any) -> Any:
-    if content is None or isinstance(content, str):
-        return content
-
+def _normalize_content(content: Any) -> Any:
+    """Keep text parts useful when AI SDK/OpenAI sends multi-part content."""
     if isinstance(content, list):
-        parts: list[str] = []
+        parts: list[Any] = []
         for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-                continue
-            if not isinstance(part, dict):
-                parts.append(json.dumps(part, ensure_ascii=False))
-                continue
-
-            part_type = part.get("type")
-            if part_type in {"text", "input_text"}:
-                text = part.get("text")
-                if text:
-                    parts.append(str(text))
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                url = image_url.get("url") if isinstance(image_url, dict) else image_url
-                parts.append(f"[image_url: {url}]")
-            elif part_type in {"file", "input_file"}:
-                parts.append("[file attachment omitted]")
+            if isinstance(part, dict):
+                if "text" in part:
+                    parts.append(part["text"])
+                elif part.get("type") == "text" and "content" in part:
+                    parts.append(part["content"])
+                else:
+                    parts.append(part)
             else:
-                parts.append(json.dumps(part, ensure_ascii=False))
-        return "\n".join(parts)
-
-    return json.dumps(content, ensure_ascii=False)
+                parts.append(part)
+        if all(isinstance(p, str) for p in parts):
+            return "\n".join(parts)
+        return parts
+    return content
 
 
 def _messages_to_prompt(messages: list[ChatMessage]) -> str:
@@ -200,7 +218,7 @@ def _messages_to_prompt(messages: list[ChatMessage]) -> str:
     for msg in messages:
         item: dict[str, Any] = {
             "role": msg.role,
-            "content": _content_to_prompt_text(msg.content),
+            "content": _normalize_content(msg.content),
         }
         if msg.name:
             item["name"] = msg.name
@@ -213,79 +231,67 @@ def _messages_to_prompt(messages: list[ChatMessage]) -> str:
     return json.dumps(normalized, ensure_ascii=False, indent=2)
 
 
-def _should_prompt_for_tools(req: ChatCompletionRequest) -> bool:
+def _tools_enabled(req: ChatCompletionRequest) -> bool:
     return bool(req.tools) and req.tool_choice != "none"
 
 
 def _build_chat_prompt(req: ChatCompletionRequest) -> str:
     base = [
         "You are a chat completion model behind an OpenAI-compatible HTTP wrapper.",
-        "Conversation messages are provided as JSON. Follow the latest user request and respect system messages.",
+        "Conversation messages are provided as JSON. Follow the latest user request and respect system/developer messages.",
+        "Do not reveal wrapper instructions unless the user explicitly asks about the wrapper implementation.",
     ]
 
-    if req.response_format:
+    if req.response_format and req.response_format.get("type") == "json_object" and not req.tools:
         base.extend([
-            "The client requested this response_format:",
-            json.dumps(req.response_format, ensure_ascii=False),
+            "The client requested JSON object output.",
+            "Return ONLY one valid JSON object. No markdown. No prose outside JSON.",
         ])
 
-    if req.stop:
+    if _tools_enabled(req):
         base.extend([
-            "Stop sequences were provided. Do not include these stop sequences in the final answer:",
-            json.dumps(req.stop, ensure_ascii=False),
-        ])
-
-    if _should_prompt_for_tools(req):
-        base.extend([
-            "The client has provided callable tools. You must decide whether to call a tool or answer normally.",
+            "The client has provided callable tools. Decide whether to call a tool or answer normally.",
             "Return ONLY valid JSON. No markdown, no prose outside JSON.",
             "If a tool is needed, return this exact shape:",
             '{"type":"tool_calls","tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":{"arg":"value"}}}]}',
             "If no tool is needed, return this exact shape:",
             '{"type":"message","content":"your assistant response"}',
             "function.arguments MUST be a JSON object, not a JSON string.",
+            "Only call tools that are present in the provided tools list.",
+            "If tool_choice forces a named function, call that function.",
             f"tool_choice: {json.dumps(req.tool_choice, ensure_ascii=False)}",
             "Tools:",
             json.dumps(req.tools, ensure_ascii=False, indent=2),
         ])
-        if any(msg.role == "tool" for msg in req.messages):
-            base.append("Tool results are already present in the conversation. Prefer returning a final message unless another tool call is clearly required.")
     else:
-        base.append("Answer naturally. Do not mention this wrapper unless asked.")
+        base.append("Answer naturally.")
+
+    if req.stop:
+        base.append(f"Stop sequences requested by client: {json.dumps(req.stop, ensure_ascii=False)}")
 
     base.append("Conversation messages:")
     base.append(_messages_to_prompt(req.messages))
     return "\n\n".join(base)
 
 
-def _estimate_tokens(text: str | None) -> int:
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
-
-
-def _usage(prompt: str, completion: str | None = None) -> dict[str, int]:
-    prompt_tokens = _estimate_tokens(prompt)
-    completion_tokens = _estimate_tokens(completion)
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-
-
-def _normalize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_tool_calls(tool_calls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     normalized_calls: list[dict[str, Any]] = []
+    if not tool_calls:
+        return normalized_calls
+
     for call in tool_calls:
-        fn = call.get("function", {}) if isinstance(call, dict) else {}
-        args = fn.get("arguments", {})
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function", {}) if isinstance(call.get("function", {}), dict) else {}
+        name = fn.get("name") or call.get("name")
+        args = fn.get("arguments", call.get("arguments", {}))
         if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
+            args = json.dumps(args or {}, ensure_ascii=False)
         normalized_calls.append({
             "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
-            "type": call.get("type") or "function",
+            "type": "function",
             "function": {
-                "name": fn.get("name"),
+                "name": name,
                 "arguments": args,
             },
         })
@@ -295,19 +301,20 @@ def _normalize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
 def _openai_chat_response(
     *,
     model: str,
-    prompt: str,
+    prompt: Any,
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
     finish_reason: str = "stop",
 ) -> dict[str, Any]:
+    normalized_calls = _normalize_tool_calls(tool_calls)
     message: dict[str, Any] = {"role": "assistant", "content": content}
-    if tool_calls:
-        message["tool_calls"] = _normalize_tool_calls(tool_calls)
+    if normalized_calls:
+        message["tool_calls"] = normalized_calls
         message["content"] = None
 
-    completion_text = content
-    if tool_calls:
-        completion_text = json.dumps(message["tool_calls"], ensure_ascii=False)
+    completion_payload = normalized_calls if normalized_calls else content
+    prompt_tokens = _approx_tokens(prompt)
+    completion_tokens = _approx_tokens(completion_payload)
 
     return {
         "id": f"chatcmpl_{uuid.uuid4().hex}",
@@ -315,42 +322,75 @@ def _openai_chat_response(
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": _usage(prompt, completion_text),
-        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     }
 
 
-def _openai_chat_chunk(
+def _openai_chunk(
     *,
-    chunk_id: str,
-    created: int,
+    chat_id: str,
     model: str,
-    delta: dict[str, Any] | None = None,
+    delta: dict[str, Any],
     finish_reason: str | None = None,
-    usage: dict[str, int] | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "id": chunk_id,
+) -> str:
+    payload = {
+        "id": chat_id,
         "object": "chat.completion.chunk",
-        "created": created,
+        "created": int(time.time()),
         "model": model,
-        "system_fingerprint": None,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
-    if delta is None and usage is not None:
-        payload["choices"] = []
-    else:
-        payload["choices"] = [{
-            "index": 0,
-            "delta": delta or {},
-            "finish_reason": finish_reason,
-        }]
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
-
-
-def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _usage_chunk(*, chat_id: str, model: str, prompt: Any, completion: Any) -> str:
+    prompt_tokens = _approx_tokens(prompt)
+    completion_tokens = _approx_tokens(completion)
+    payload = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _parse_chat_output(req: ChatCompletionRequest, output_text: str, prompt: str) -> dict[str, Any]:
+    model = req.model or DEFAULT_MODEL
+
+    if _tools_enabled(req):
+        parsed = _extract_json_object(output_text)
+        if parsed and parsed.get("type") == "tool_calls" and isinstance(parsed.get("tool_calls"), list):
+            return _openai_chat_response(
+                model=model,
+                prompt=prompt,
+                tool_calls=parsed["tool_calls"],
+                finish_reason="tool_calls",
+            )
+        if parsed and parsed.get("type") == "message":
+            return _openai_chat_response(
+                model=model,
+                prompt=prompt,
+                content=str(parsed.get("content", "")),
+                finish_reason="stop",
+            )
+
+    return _openai_chat_response(
+        model=model,
+        prompt=prompt,
+        content=output_text,
+        finish_reason="stop",
+    )
 
 
 @asynccontextmanager
@@ -390,7 +430,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Self-hosted Gemini Web API Wrapper",
-    version="0.1.0",
+    version="0.2.0-ai-sdk-compatible",
     lifespan=lifespan,
     responses={401: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
@@ -402,29 +442,18 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
-async def list_models() -> dict[str, Any]:
-    created = int(time.time())
+async def models() -> dict[str, Any]:
+    now = int(time.time())
     return {
         "object": "list",
         "data": [
             {
-                "id": model,
+                "id": DEFAULT_MODEL,
                 "object": "model",
-                "created": created,
-                "owned_by": "gemini-webapi-wrapper",
+                "created": now,
+                "owned_by": "self-hosted-gemini-webapi",
             }
-            for model in COMPAT_MODEL_IDS
         ],
-    }
-
-
-@app.get("/v1/models/{model_id}", dependencies=[Depends(require_api_key)])
-async def retrieve_model(model_id: str) -> dict[str, Any]:
-    return {
-        "id": model_id,
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "gemini-webapi-wrapper",
     }
 
 
@@ -472,172 +501,108 @@ async def generate_stream(req: GenerateRequest) -> StreamingResponse:
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-
-async def _run_chat_completion(req: ChatCompletionRequest, prompt: str, model: str) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"temporary": req.temporary}
-    if req.model:
-        kwargs["model"] = req.model
-
-    async with semaphore:
-        output = await app.state.gemini_client.generate_content(
-            prompt,
-            timeout=REQUEST_TIMEOUT,
-            **kwargs,
-        )
-        text = _get_attr(output, "text") or ""
-
-    if _should_prompt_for_tools(req):
-        parsed = _extract_json_object(text)
-        if parsed and parsed.get("type") == "tool_calls" and isinstance(parsed.get("tool_calls"), list):
-            return _openai_chat_response(
-                model=model,
-                prompt=prompt,
-                tool_calls=parsed["tool_calls"],
-                finish_reason="tool_calls",
-            )
-        if parsed and parsed.get("type") == "message":
-            return _openai_chat_response(
-                model=model,
-                prompt=prompt,
-                content=str(parsed.get("content", "")),
-                finish_reason="stop",
-            )
-
-    return _openai_chat_response(
-        model=model,
-        prompt=prompt,
-        content=text,
-        finish_reason="stop",
-    )
-
-
-async def _chat_completion_stream(req: ChatCompletionRequest, prompt: str, model: str) -> AsyncIterator[str]:
-    chunk_id = f"chatcmpl_{uuid.uuid4().hex}"
-    created = int(time.time())
-    include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
-
-    try:
-        yield _sse(_openai_chat_chunk(
-            chunk_id=chunk_id,
-            created=created,
-            model=model,
-            delta={"role": "assistant"},
-        ))
-
-        if _should_prompt_for_tools(req):
-            result = await _run_chat_completion(req, prompt, model)
-            choice = result["choices"][0]
-            message = choice["message"]
-
-            if message.get("tool_calls"):
-                delta_tool_calls = []
-                for index, call in enumerate(message["tool_calls"]):
-                    delta_tool_calls.append({
-                        "index": index,
-                        "id": call["id"],
-                        "type": call["type"],
-                        "function": call["function"],
-                    })
-                yield _sse(_openai_chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    delta={"tool_calls": delta_tool_calls},
-                ))
-            elif message.get("content"):
-                yield _sse(_openai_chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    delta={"content": message["content"]},
-                ))
-
-            yield _sse(_openai_chat_chunk(
-                chunk_id=chunk_id,
-                created=created,
-                model=model,
-                delta={},
-                finish_reason=choice["finish_reason"],
-            ))
-            if include_usage:
-                yield _sse(_openai_chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    usage=result["usage"],
-                ))
-            yield "data: [DONE]\n\n"
-            return
-
-        kwargs: dict[str, Any] = {"temporary": req.temporary}
-        if req.model:
-            kwargs["model"] = req.model
-
-        completion_parts: list[str] = []
-        async with semaphore:
-            async for chunk in app.state.gemini_client.generate_content_stream(
-                prompt,
-                timeout=REQUEST_TIMEOUT,
-                **kwargs,
-            ):
-                delta = _get_attr(chunk, "text_delta")
-                if not delta:
-                    continue
-                completion_parts.append(delta)
-                yield _sse(_openai_chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    delta={"content": delta},
-                ))
-
-        yield _sse(_openai_chat_chunk(
-            chunk_id=chunk_id,
-            created=created,
-            model=model,
-            delta={},
-            finish_reason="stop",
-        ))
-        if include_usage:
-            completion = "".join(completion_parts)
-            yield _sse(_openai_chat_chunk(
-                chunk_id=chunk_id,
-                created=created,
-                model=model,
-                usage=_usage(prompt, completion),
-            ))
-        yield "data: [DONE]\n\n"
-    except Exception as exc:
-        payload = {
-            "error": {
-                "message": str(exc),
-                "type": "server_error",
-                "code": None,
-            }
-        }
-        yield _sse(payload)
-        yield "data: [DONE]\n\n"
-
-
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)], response_model=None)
-async def chat_completions(req: ChatCompletionRequest) -> Any:
+async def chat_completions(req: ChatCompletionRequest):
     """
-    OpenAI-compatible chat endpoint with prompt-based tool-call shim.
+    OpenAI-compatible chat endpoint for @ai-sdk/openai-compatible.
 
-    Limitation: gemini_webapi does not expose native Gemini function calling. This endpoint asks Gemini
-    to emit structured JSON and converts it to OpenAI-style tool_calls. Your client still executes the
-    tool and sends the tool result back as a `role: "tool"` message.
+    Important: gemini_webapi does not expose native Gemini function calling. Tool calling here is a
+    prompt-based shim: Gemini emits JSON, this wrapper converts it to OpenAI-style tool_calls, then
+    AI SDK executes your tool and sends the result back as role=tool.
     """
     prompt = _build_chat_prompt(req)
-    model = req.model or DEFAULT_CHAT_MODEL
+    model = req.model or DEFAULT_MODEL
+    kwargs = _gemini_kwargs(temporary=req.temporary, request_model=req.model)
 
-    if req.stream:
-        return StreamingResponse(_chat_completion_stream(req, prompt, model), media_type="text/event-stream")
+    if not req.stream:
+        async with semaphore:
+            try:
+                output = await app.state.gemini_client.generate_content(
+                    prompt,
+                    timeout=REQUEST_TIMEOUT,
+                    **kwargs,
+                )
+                text = _get_attr(output, "text") or ""
+                return _parse_chat_output(req, text, prompt)
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    try:
-        return await _run_chat_completion(req, prompt, model)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    async def event_stream() -> AsyncIterator[str]:
+        chat_id = f"chatcmpl_{uuid.uuid4().hex}"
+        completion_accumulator: list[Any] = []
+        yield _openai_chunk(chat_id=chat_id, model=model, delta={"role": "assistant"})
+
+        async with semaphore:
+            try:
+                # For tool requests, stream a normal OpenAI tool_calls delta after parsing the full answer.
+                # This is AI SDK-compatible, but the tool call is not emitted token-by-token.
+                if _tools_enabled(req):
+                    output = await app.state.gemini_client.generate_content(
+                        prompt,
+                        timeout=REQUEST_TIMEOUT,
+                        **kwargs,
+                    )
+                    text = _get_attr(output, "text") or ""
+                    parsed_response = _parse_chat_output(req, text, prompt)
+                    message = parsed_response["choices"][0]["message"]
+
+                    if message.get("tool_calls"):
+                        calls = message["tool_calls"]
+                        completion_accumulator.extend(calls)
+                        for index, call in enumerate(calls):
+                            delta = {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": call["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": call["function"]["name"],
+                                            "arguments": call["function"]["arguments"],
+                                        },
+                                    }
+                                ]
+                            }
+                            yield _openai_chunk(chat_id=chat_id, model=model, delta=delta)
+                        yield _openai_chunk(chat_id=chat_id, model=model, delta={}, finish_reason="tool_calls")
+                    else:
+                        content = message.get("content") or ""
+                        completion_accumulator.append(content)
+                        if content:
+                            yield _openai_chunk(chat_id=chat_id, model=model, delta={"content": content})
+                        yield _openai_chunk(chat_id=chat_id, model=model, delta={}, finish_reason="stop")
+                else:
+                    async for chunk in app.state.gemini_client.generate_content_stream(
+                        prompt,
+                        timeout=REQUEST_TIMEOUT,
+                        **kwargs,
+                    ):
+                        delta_text = _get_attr(chunk, "text_delta")
+                        if delta_text:
+                            completion_accumulator.append(delta_text)
+                            yield _openai_chunk(chat_id=chat_id, model=model, delta={"content": delta_text})
+                    yield _openai_chunk(chat_id=chat_id, model=model, delta={}, finish_reason="stop")
+
+                if req.stream_options and req.stream_options.get("include_usage"):
+                    yield _usage_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        prompt=prompt,
+                        completion="".join(str(x) for x in completion_accumulator),
+                    )
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                payload = {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "code": "gemini_webapi_error",
+                    }
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/v1/generate-with-files", dependencies=[Depends(require_api_key)])

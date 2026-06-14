@@ -1,6 +1,25 @@
-# Self-hosted Gemini Web API wrapper
+# Gemini WebAPI self-host wrapper — AI SDK compatible
 
-This wraps `gemini_webapi` with a small FastAPI server and Docker Compose.
+This wraps `gemini_webapi` with a small FastAPI server and exposes an OpenAI-compatible endpoint that works with `@ai-sdk/openai-compatible`.
+
+> Important: `gemini_webapi` is a reverse-engineered wrapper around the Gemini web app. Tool calling in this server is a prompt-based shim, not native Gemini function calling.
+
+## Supported endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Health check |
+| `GET /v1/models` | OpenAI-compatible model list |
+| `POST /v1/chat/completions` | OpenAI-compatible chat completions for AI SDK |
+| `POST /v1/generate` | Simple direct wrapper endpoint |
+| `POST /v1/generate/stream` | Simple direct SSE wrapper endpoint |
+| `POST /v1/generate-with-files` | Simple direct file upload endpoint |
+
+`/v1/chat/completions` accepts both non-streaming and streaming requests:
+
+- `stream: false` returns a normal OpenAI-style `chat.completion` response.
+- `stream: true` returns OpenAI-style `text/event-stream` chunks ending with `data: [DONE]`.
+- When tools are provided, the server asks Gemini to emit JSON and converts it into OpenAI-style `tool_calls`.
 
 ## 1. Prepare env
 
@@ -11,11 +30,17 @@ nano .env
 
 Fill:
 
-- `APP_API_KEY`
-- `GEMINI_SECURE_1PSID`
-- `GEMINI_SECURE_1PSIDTS`
+```env
+APP_API_KEY=your-long-random-key
+GEMINI_SECURE_1PSID=...
+GEMINI_SECURE_1PSIDTS=...
+OPENAI_COMPAT_MODEL=gemini-web
+# Optional: GEMINI_WEB_MODEL=<supported-gemini_webapi-model>
+```
 
-Get cookies from a browser logged in to `https://gemini.google.com`: DevTools → Network → any request → Request Headers → Cookie.
+Get Gemini cookies from a browser logged in to `https://gemini.google.com`:
+
+DevTools → Network → any request → Request Headers → Cookie.
 
 Use a separate Google account/browser session when possible.
 
@@ -26,38 +51,159 @@ docker compose up -d --build
 docker compose logs -f gemini-api
 ```
 
-## 3. Test
+## 3. Test with curl
+
+Health:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
+Models:
+
 ```bash
-curl -X POST http://localhost:8000/v1/generate \
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer abcd1234-5678-90ef-ghij-klmnopqrstuv"
+```
+
+Chat completion:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: change-me-long-random-key" \
-  -d '{"prompt":"Hello, reply in Vietnamese", "temporary": true}'
+  -H "Authorization: Bearer abcd1234-5678-90ef-ghij-klmnopqrstuv" \
+  -d '{
+    "model": "gemini-web",
+    "messages": [{"role":"user","content":"Reply in Vietnamese: hello"}]
+  }'
 ```
 
 Streaming:
 
 ```bash
-curl -N -X POST http://localhost:8000/v1/generate/stream \
+curl -N -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: change-me-long-random-key" \
-  -d '{"prompt":"Explain Docker in Vietnamese", "temporary": true}'
+  -H "Authorization: Bearer abcd1234-5678-90ef-ghij-klmnopqrstuv" \
+  -d '{
+    "model": "gemini-web",
+    "stream": true,
+    "messages": [{"role":"user","content":"Explain Docker in Vietnamese"}]
+  }'
 ```
 
-File upload:
+Tool call:
 
 ```bash
-curl -X POST http://localhost:8000/v1/generate-with-files \
-  -H "X-API-Key: change-me-long-random-key" \
-  -F "prompt=Summarize this file" \
-  -F "files=@./sample.pdf"
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer abcd1234-5678-90ef-ghij-klmnopqrstuv" \
+  -d '{
+    "model": "gemini-web",
+    "messages": [{"role":"user","content":"Weather in Ho Chi Minh City?"}],
+    "tools": [
+      {
+        "type":"function",
+        "function":{
+          "name":"get_weather",
+          "description":"Get current weather by city",
+          "parameters":{
+            "type":"object",
+            "properties":{"city":{"type":"string"}},
+            "required":["city"]
+          }
+        }
+      }
+    ],
+    "tool_choice":"auto"
+  }'
 ```
 
-## 4. Nginx
+## 4. Use with AI SDK
+
+Install:
+
+```bash
+pnpm add ai @ai-sdk/openai-compatible zod
+```
+
+Create provider:
+
+```ts
+// lib/gemini-web.ts
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+
+export const geminiWeb = createOpenAICompatible({
+  name: 'gemini-web',
+  baseURL: process.env.GEMINI_WEB_BASE_URL ?? 'http://localhost:8000/v1',
+  apiKey: process.env.GEMINI_WEB_API_KEY,
+});
+```
+
+Generate text:
+
+```ts
+import { generateText } from 'ai';
+import { geminiWeb } from './lib/gemini-web';
+
+const result = await generateText({
+  model: geminiWeb('gemini-web'),
+  prompt: 'Viết 3 ý tưởng micro SaaS cho developer Việt Nam',
+});
+
+console.log(result.text);
+```
+
+Use tools:
+
+```ts
+import { generateText, stepCountIs, tool } from 'ai';
+import { z } from 'zod';
+import { geminiWeb } from './lib/gemini-web';
+
+const result = await generateText({
+  model: geminiWeb('gemini-web'),
+  prompt: 'Tìm phòng trọ Quận 7 dưới 5 triệu',
+  tools: {
+    searchRooms: tool({
+      description: 'Search rental rooms from database',
+      inputSchema: z.object({
+        district: z.string(),
+        maxPrice: z.number(),
+      }),
+      execute: async ({ district, maxPrice }) => {
+        return [
+          { title: 'Studio Tân Thuận', price: 4_500_000, district },
+          { title: 'Phòng gần Lotte Q7', price: 5_000_000, district },
+        ];
+      },
+    }),
+  },
+  stopWhen: stepCountIs(3),
+});
+
+console.log(result.text);
+```
+
+Stream in a Next.js route:
+
+```ts
+// app/api/chat/route.ts
+import { streamText } from 'ai';
+import { geminiWeb } from '@/lib/gemini-web';
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: geminiWeb('gemini-web'),
+    messages,
+  });
+
+  return result.toUIMessageStreamResponse();
+}
+```
+
+## 5. Nginx
 
 Edit `nginx/gemini-api.conf`, replace `gemini-api.example.com`, then:
 
@@ -74,168 +220,23 @@ Add TLS with Certbot:
 sudo certbot --nginx -d gemini-api.example.com
 ```
 
-## Notes
+Then AI SDK config becomes:
+
+```ts
+export const geminiWeb = createOpenAICompatible({
+  name: 'gemini-web',
+  baseURL: 'https://gemini-api.example.com/v1',
+  apiKey: process.env.GEMINI_WEB_API_KEY,
+});
+```
+
+## Notes and limitations
 
 - Do not expose this without auth. Cookies grant access to your Gemini web session.
-- This is a reverse-engineered web wrapper, so it can break when Google changes Gemini web internals.
+- Prefer `Authorization: Bearer <APP_API_KEY>` for AI SDK.
+- `OPENAI_COMPAT_MODEL` is just the model id shown to OpenAI-compatible clients. Leave `GEMINI_WEB_MODEL` empty unless you know the internal model values supported by `gemini_webapi`.
+- `X-API-Key` is still supported for curl/custom clients.
+- Tool calling is prompt-based. Always validate tool arguments in your own backend.
+- For dangerous actions such as payment, deletion, or sending real emails, require human confirmation.
+- This wrapper can break when Google changes Gemini web internals.
 - If auth fails, refresh the cookies and restart the container.
-
-## 5. OpenAI-compatible chat + tool-call shim
-
-This wrapper also includes a best-effort `/v1/chat/completions` endpoint.
-
-Important limitation: `gemini_webapi` talks to the Gemini web app and does **not** expose native Gemini API `tools` / function-calling. This endpoint simulates tool calling by asking Gemini to return strict JSON, then converts that JSON into OpenAI-style `tool_calls`.
-
-Your client must still execute the function and send the result back as a `role: "tool"` message, same as OpenAI's flow.
-
-Compatibility notes:
-
-- Auth accepts either `X-API-Key: ...` or OpenAI-style `Authorization: Bearer ...`.
-- `GET /v1/models` is available for OpenAI-compatible clients.
-- `stream: true` returns OpenAI-style `text/event-stream` chunks with `chat.completion.chunk` objects and a final `data: [DONE]`.
-- `usage` token counts are approximate because Gemini Web does not expose token accounting here.
-- Multimodal message parts are accepted for client compatibility, but image/file parts are only represented as text placeholders in the prompt. Use `/v1/generate-with-files` for real file upload.
-
-Example first request:
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer change-me-long-random-key" \
-  -d '{
-    "model": "gemini-3-flash-thinking-advanced",
-    "messages": [
-      {"role": "user", "content": "Weather in Ho Chi Minh City?"}
-    ],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "description": "Get current weather by city name",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "city": {"type": "string"}
-            },
-            "required": ["city"]
-          }
-        }
-      }
-    ],
-    "tool_choice": "auto"
-  }'
-```
-
-Possible response:
-
-```json
-{
-  "choices": [
-    {
-      "message": {
-        "role": "assistant",
-        "content": null,
-        "tool_calls": [
-          {
-            "id": "call_xxx",
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "arguments": "{\"city\":\"Ho Chi Minh City\"}"
-            }
-          }
-        ]
-      },
-      "finish_reason": "tool_calls"
-    }
-  ]
-}
-```
-
-Streaming request:
-
-```bash
-curl -N -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer change-me-long-random-key" \
-  -d '{
-    "model": "gemini-3-flash-thinking-advanced",
-    "stream": true,
-    "stream_options": {"include_usage": true},
-    "messages": [
-      {"role": "user", "content": "Reply with one short Vietnamese sentence."}
-    ]
-  }'
-```
-
-OpenAI Node SDK:
-
-```js
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: process.env.APP_API_KEY,
-  baseURL: "http://localhost:8000/v1",
-});
-
-const completion = await client.chat.completions.create({
-  model: "gemini-3-flash-thinking-advanced",
-  messages: [{ role: "user", content: "Say hello in Vietnamese." }],
-});
-
-console.log(completion.choices[0].message.content);
-```
-
-Vercel AI SDK:
-
-```js
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { streamText } from "ai";
-
-const geminiWeb = createOpenAICompatible({
-  name: "gemini-web",
-  apiKey: process.env.APP_API_KEY,
-  baseURL: "http://localhost:8000/v1",
-  includeUsage: true,
-});
-
-const result = streamText({
-  model: geminiWeb("gemini-3-flash-thinking-advanced"),
-  messages: [{ role: "user", content: "Say hello in Vietnamese." }],
-});
-
-for await (const delta of result.textStream) {
-  process.stdout.write(delta);
-}
-```
-
-Then your app executes `get_weather`, and sends a second request with the tool result:
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "Weather in Ho Chi Minh City?"},
-    {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [
-        {
-          "id": "call_xxx",
-          "type": "function",
-          "function": {
-            "name": "get_weather",
-            "arguments": "{\"city\":\"Ho Chi Minh City\"}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_xxx",
-      "content": "{\"city\":\"Ho Chi Minh City\",\"temp_c\":31,\"condition\":\"Cloudy\"}"
-    }
-  ],
-  "tools": [/* same tools */]
-}
-```
