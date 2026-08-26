@@ -30,14 +30,30 @@ def _env_bool(name: str, default: bool = False) -> bool:
 FORWARD_OPENAI_MODEL_TO_GEMINI = _env_bool("FORWARD_OPENAI_MODEL_TO_GEMINI", True)
 
 
+MODEL_ALIASES = {
+    "gemini-3.7-flash": "gemini-flash",
+    "3.7-flash": "gemini-flash",
+    "gemini-3.5-flash-lite": "gemini-flash-lite",
+    "3.5-flash-lite": "gemini-flash-lite",
+    "gemini-3.1-pro": "gemini-pro",
+    "3.1-pro": "gemini-pro",
+    "gemini-3.7-flash-thinking": "gemini-pro",
+    "gemini-2.0-flash": "gemini-flash",
+    "gemini-1.5-pro": "gemini-pro",
+    "gemini-1.5-flash": "gemini-flash",
+}
+
+
 def _gemini_kwargs(*, temporary: bool, request_model: str | None = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"temporary": temporary}
     # OPENAI_COMPAT_MODEL is the public model id for OpenAI-compatible clients.
     # GEMINI_WEB_MODEL is the optional internal model id forwarded to gemini_webapi.
     if GEMINI_WEB_MODEL:
-        kwargs["model"] = GEMINI_WEB_MODEL
+        target = MODEL_ALIASES.get(GEMINI_WEB_MODEL, GEMINI_WEB_MODEL)
+        kwargs["model"] = target
     elif FORWARD_OPENAI_MODEL_TO_GEMINI and request_model and request_model != DEFAULT_MODEL:
-        kwargs["model"] = request_model
+        target = MODEL_ALIASES.get(request_model, request_model)
+        kwargs["model"] = target
     return kwargs
 
 
