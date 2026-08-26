@@ -27,14 +27,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-FORWARD_OPENAI_MODEL_TO_GEMINI = _env_bool("FORWARD_OPENAI_MODEL_TO_GEMINI", False)
+FORWARD_OPENAI_MODEL_TO_GEMINI = _env_bool("FORWARD_OPENAI_MODEL_TO_GEMINI", True)
 
 
 def _gemini_kwargs(*, temporary: bool, request_model: str | None = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"temporary": temporary}
     # OPENAI_COMPAT_MODEL is the public model id for OpenAI-compatible clients.
     # GEMINI_WEB_MODEL is the optional internal model id forwarded to gemini_webapi.
-    # By default we do NOT forward arbitrary OpenAI-compatible model ids to gemini_webapi.
     if GEMINI_WEB_MODEL:
         kwargs["model"] = GEMINI_WEB_MODEL
     elif FORWARD_OPENAI_MODEL_TO_GEMINI and request_model and request_model != DEFAULT_MODEL:
