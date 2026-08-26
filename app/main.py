@@ -440,18 +440,43 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+DEFAULT_SUPPORTED_MODELS = [
+    DEFAULT_MODEL,
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro",
+    "gemini-3.7-flash-thinking",
+    "3.7-flash",
+    "3.5-flash-lite",
+    "3.1-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+]
+
+
+def _get_supported_models() -> list[str]:
+    raw = os.getenv("SUPPORTED_MODELS")
+    if raw:
+        models_list = [m.strip() for m in raw.split(",") if m.strip()]
+        if models_list:
+            return models_list
+    return DEFAULT_SUPPORTED_MODELS
+
+
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
 async def models() -> dict[str, Any]:
     now = int(time.time())
+    model_ids = _get_supported_models()
     return {
         "object": "list",
         "data": [
             {
-                "id": DEFAULT_MODEL,
+                "id": model_id,
                 "object": "model",
                 "created": now,
                 "owned_by": "self-hosted-gemini-webapi",
             }
+            for model_id in model_ids
         ],
     }
 
